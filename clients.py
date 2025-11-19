@@ -6,7 +6,7 @@ from collections import deque
 import torch
 import torch.nn.functional as F
 import logging
-
+import copy
 from utils import utils
 
 class Client():
@@ -103,11 +103,18 @@ class Client():
 
     def get_avg_grad(self):
         return torch.cat([v.flatten() for v in self.avg_delta.values()])
-
+    
+    def get_avg_grad_old(self):
+        return self.avg_delta
+    
     def get_sum_hog(self):
         #return utils.net2vec(self.sum_hog)
         return torch.cat([v.flatten() for v in self.sum_hog.values()])
 
+    def get_sum_hog_old(self):
+        #return utils.net2vec(self.sum_hog)
+        return self.sum_hog
+    
     def get_L2_sum_hog(self):
         X = self.get_sum_hog()
         #X = torch.cat([v.flatten() for v in self.sum_hog.values()])
@@ -123,3 +130,30 @@ class Client():
         X = torch.cat([v.flatten() for v in self.stateChange.values()])
         #X = utils.net2vec(self.stateChange)
         return torch.linalg.norm(X)
+    
+
+    
+    
+    
+def test_q(clients):
+    w_serial=[]
+        #Delta = deepcopy(self.emptyStates)
+        
+    w_noise = copy.deepcopy(clients[0].getDelta())
+    for p in clients[0].getDelta():
+            w_noise[p] =torch.rand(w_noise[p].size())
+    W_vecs = [utils.net2vec(w_noise)]
+    W_vecs = [vec for vec in W_vecs if torch.isfinite(vec).all().item()]  
+
+    w_serial.append(copy.deepcopy(W_vecs[0]))
+    deltas = [c.getDelta() for c in clients]
+    vecs = [utils.net2vec(delta) for delta in deltas]
+    vecs = [vec for vec in vecs if torch.isfinite(vec).all().item()]
+    #遍历向量vecs中的每一个元素
+    for delta in vecs:
+        for i, value in enumerate(delta):
+            W_vecs[0][i] += value
+    
+        
+    w_serial.append(copy.deepcopy(W_vecs[0]))
+    return w_serial
