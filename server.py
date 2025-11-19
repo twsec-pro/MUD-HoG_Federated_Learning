@@ -2,121 +2,453 @@ from __future__ import print_function
 
 from copy import deepcopy
 
+import pandas as pd
+from sklearn.linear_model import LinearRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import PolynomialFeatures
 import torch
 import torch.nn.functional as F
 import logging
 from datetime import datetime
 import numpy as np
+
 from sklearn.cluster import KMeans, AgglomerativeClustering, DBSCAN
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, deque
+from scipy.spatial.distance import cosine
 
 from utils import utils
 from utils.backdoor_semantic_utils import SemanticBackdoor_Utils
 from utils.backdoor_utils import Backdoor_Utils
 import time
 import json
+import copy
+import clients as cl
 
-def find_separate_point(d):
-    # d should be flatten and np or list
-    d = sorted(d)
-    sep_point = 0
+
+def find_threshold_by_max_gap(values, return_gap_info=False):
+    """
+    Finds a threshold by identifying the largest gap in a sorted list of values.
+    This is useful for separating clusters of data.
+    """
+    if len(values) < 2:
+        return 0.0 if not return_gap_info else (0.0, 0.0, 0.0, 0.0)
+
+    sorted_values = sorted(values)
     max_gap = 0
-    for i in range(len(d)-1):
-        if d[i+1] - d[i] > max_gap:
-            max_gap = d[i+1] - d[i]
-            sep_point = d[i] + max_gap/2
-    return sep_point
+    max_gap_idx = 0
 
-def DBSCAN_cluster_minority(dict_data):
-    ids = np.array(list(dict_data.keys()))
-    values = np.array(list(dict_data.values()))
-    if len(values.shape) == 1:
-        values = values.reshape(-1,1)
-    cluster_ = DBSCAN(n_jobs=-1).fit(values)
-    offset_ids = find_minority_id(cluster_)
-    minor_id = ids[list(offset_ids)]
-    return minor_id
+    for i in range(len(sorted_values) - 1):
+        gap = sorted_values[i + 1] - sorted_values[i]
+        if gap > max_gap:
+            max_gap = gap
+            max_gap_idx = i
 
-def Kmean_cluster_minority(dict_data):
-    ids = np.array(list(dict_data.keys()))
-    values = np.array(list(dict_data.values()))
-    if len(values.shape) == 1:
-        values = values.reshape(-1,1)
-    cluster_ = KMeans(n_clusters=2, random_state=0).fit(values)
-    offset_ids = find_minority_id(cluster_)
-    minor_id = ids[list(offset_ids)]
-    return minor_id
+    lower_bound = sorted_values[max_gap_idx]
+    upper_bound = sorted_values[max_gap_idx + 1]
+    threshold = (lower_bound + upper_bound) / 2.0
 
-def find_minority_id(clf):
-    count_1 = sum(clf.labels_ == 1)
-    count_0 = sum(clf.labels_ == 0)
-    mal_label = 0 if count_1 > count_0 else 1
-    atk_id = np.where(clf.labels_ == mal_label)[0]
-    atk_id = set(atk_id.reshape((-1)))
-    return atk_id
+    if return_gap_info:
+        return threshold, max_gap, lower_bound, upper_bound
+    else:
+        return threshold
 
-def find_majority_id(clf):
-    counts = Counter(clf.labels_)
-    major_label = max(counts, key=counts.get)
-    major_id = np.where(clf.labels_ == major_label)[0]
-    #major_id = set(major_id.reshape(-1))
-    return major_id
 
-def find_targeted_attack_complex(dict_lHoGs, cosine_dist=False):
-    """Construct a set of suspecious of targeted and unreliable clients
-    by using [normalized] long HoGs (dict_lHoGs dictionary).
-    We use two ways of clustering to find all possible suspicious clients:
-      - 1st cluster: Using KMeans (K=2) based on Euclidean distance of
-      long_HoGs==> find minority ids.
-      - 2nd cluster: Using KMeans (K=2) based on angles between
-      long_HoGs to median (that is calculated based on only
-      normal clients output from the 1st cluster KMeans).
+def detect_sign_flipping_with_global(short_HoGs, global_short):
     """
-    id_lHoGs = np.array(list(dict_lHoGs.keys()))
-    value_lHoGs = np.array(list(dict_lHoGs.values()))
-    cluster_lh1 = KMeans(n_clusters=2, random_state=0).fit(value_lHoGs)
-    offset_tAtk_id1 = find_minority_id(cluster_lh1)
-    sus_tAtk_id1 = id_lHoGs[list(offset_tAtk_id1)]
-    logging.info(f"sus_tAtk_id1: {sus_tAtk_id1}")
+    Sign-Flipping Detection: Detects clients whose updates oppose the global direction.
+    """
+    flip_sign_id = set()
+    if len(short_HoGs) < 3:
+        return flip_sign_id
+    global_norm = np.linalg.norm(global_short)
+    if global_norm < 1e-10:
+        return flip_sign_id
+    for client_id, client_short in short_HoGs.items():
+        client_short_vec = np.array(list(client_short))
+        client_norm = np.linalg.norm(client_short_vec)
+        if client_norm < 1e-10:
+            continue
+        cos_sim = np.dot(global_short, client_short_vec) / (global_norm * client_norm)
+        if cos_sim < 0:
+            flip_sign_id.add(client_id)
+    logging.info(f"[Sign-Flip Detection] Detected: {len(flip_sign_id)} clients - {sorted(list(flip_sign_id))}")
+    return flip_sign_id
 
-    offset_normal_ids = find_majority_id(cluster_lh1)
-    normal_ids = id_lHoGs[list(offset_normal_ids)]
-    normal_lHoGs = value_lHoGs[list(offset_normal_ids)]
-    median_normal_lHoGs = np.median(normal_lHoGs, axis=0)
-    d_med_lHoGs = {}
-    for idx in id_lHoGs:
-        if cosine_dist:
-            # cosine similarity between median and all long HoGs points.
-            d_med_lHoGs[idx] = np.dot(dict_lHoGs[idx], median_normal_lHoGs)
+
+def detect_noise_injection_with_global(short_HoGs, global_short, excluded_ids):
+    """
+    Noise Injection Detection: Detects clients with abnormally large gradient magnitudes.
+    （本函数保留，但在当前版本的 mud_hog 中不再调用）
+    """
+    noise_injection_id = set()
+    remaining_clients = {k: v for k, v in short_HoGs.items() if k not in excluded_ids}
+    if len(remaining_clients) < 3:
+        return noise_injection_id
+    magnitudes = {cid: np.linalg.norm(np.array(list(c_short))) for cid, c_short in remaining_clients.items()}
+    if not magnitudes:
+        return noise_injection_id
+    mag_values = np.array(list(magnitudes.values()))
+    q1, q3 = np.percentile(mag_values, [25, 75])
+    upper_bound = q3 + 1.5 * (q3 - q1)
+    for client_id, mag in magnitudes.items():
+        if mag > upper_bound:
+            noise_injection_id.add(client_id)
+    logging.info(f"[Noise-Injection Detection] Detected: {len(noise_injection_id)} clients - {sorted(list(noise_injection_id))}")
+    return noise_injection_id
+
+
+def find_best_threshold_adaptive(values, min_gap_size=0.05, gap_cos_upper=0.7):
+    """
+    自适应间隙选择
+    
+    Parameters:
+    -----------
+    values : list
+        相似度值列表
+    min_gap_size : float
+        最小间隙阈值
+    gap_cos_upper : float
+        间隙中点上限
+    
+    Returns:
+    --------
+    float or None : 选定的阈值，无合适阈值返回None
+    """
+    if not values or len(values) < 2:
+        logging.info(f"  [Adaptive-Gap] Too few values ({len(values) if values else 0})")
+        return None
+
+    sorted_values = sorted(values)
+    all_gaps = []
+
+    # 计算所有间隙
+    for i in range(len(sorted_values) - 1):
+        gap = sorted_values[i + 1] - sorted_values[i]
+        midpoint = (sorted_values[i] + sorted_values[i + 1]) / 2
+        all_gaps.append((gap, midpoint, i, sorted_values[i], sorted_values[i + 1]))
+
+    if not all_gaps:
+        logging.info(f"  [Adaptive-Gap] No gaps to analyze")
+        return None
+
+    # 按间隙大小降序排序
+    all_gaps_sorted = sorted(all_gaps, key=lambda x: x[0], reverse=True)
+
+    logging.info(f"  [Adaptive-Gap] Analyzing {len(all_gaps)} gaps, top 3:")
+    for rank, (gap, mid, idx, low, up) in enumerate(all_gaps_sorted[:3], 1):
+        logging.info(f"    #{rank}: gap={gap:.4f}, mid={mid:.4f}, range=[{low:.4f}, {up:.4f}]")
+
+    # 选择第一个满足条件的间隙
+    for gap, midpoint, idx, low, up in all_gaps_sorted:
+        meets_size = gap > min_gap_size
+        meets_upper = midpoint < gap_cos_upper
+
+        if meets_size and meets_upper:
+            logging.info(f"  [Adaptive-Gap] ✅ Selected: gap={gap:.4f}, mid={midpoint:.4f}")
+            return midpoint
+
+    logging.info(f"  [Adaptive-Gap] ❌ No gap satisfies both conditions (size>{min_gap_size}, mid<{gap_cos_upper})")
+    return None
+
+
+# ==================================================================================
+# ✅✅✅ 改进：基于共识符号选举的两级检测 ✅✅✅
+# ==================================================================================
+
+def detect_label_flipping_two_level(long_HoGs, excluded_ids,
+                                    hard_threshold=0.0,
+                                    min_gap_size=0.1,
+                                    gap_cos_upper=0.7,
+                                    min_normal_ratio=0.3):
+    """
+    ✅ 改进版两级检测策略：基于共识符号选举
+    
+    核心改进：
+    1. 先计算初步共识方向
+    2. 统计客户端与共识方向的余弦相似度符号（正/负）
+    3. 通过投票决定最终共识符号：超过一半为正则共识为正，否则为负
+    4. Level 1: 检测与共识符号相反的客户端
+    5. Level 2: 在同符号客户端中使用自适应间隙检测微妙攻击
+    """
+    detected_attackers = set()
+    remaining_clients = {k: v for k, v in long_HoGs.items() if k not in excluded_ids}
+
+    total_clients = len(remaining_clients)
+
+    if total_clients < 4:
+        logging.info("[LFD-ConsensusVoting] Too few clients, skipping detection.")
+        return detected_attackers
+
+    logging.info("=" * 80)
+    logging.info("LABEL-FLIPPING DETECTION (Consensus Sign Voting + Two-Level)")
+    logging.info("=" * 80)
+    logging.info(f"Total clients to analyze: {total_clients}")
+    logging.info(f"Excluded by previous detection: {sorted(list(excluded_ids))}")
+    logging.info(f"Parameters:")
+    logging.info(f"  hard_threshold:        {hard_threshold}")
+    logging.info(f"  min_gap_size:          {min_gap_size}")
+    logging.info(f"  gap_cos_upper:         {gap_cos_upper}")
+    logging.info(f"  min_normal_ratio:      {min_normal_ratio}")
+
+    # ========================================================================
+    # STEP 1: 提取长历史向量（最后两层参数）
+    # ========================================================================
+    logging.info("\n" + "=" * 80)
+    logging.info("STEP 1: Extracting Long-History Vectors (Last 2 Layers)")
+    logging.info("=" * 80)
+
+    try:
+        sample_state_dict = next(iter(remaining_clients.values()))
+        last_layer_keys = list(sample_state_dict.keys())[-2:]
+        logging.info(f"Using last 2 layers: {last_layer_keys}")
+    except (StopIteration, IndexError):
+        logging.error("[LFD-ConsensusVoting] Cannot extract layer keys.")
+        return detected_attackers
+
+    client_vectors = []
+    client_ids = []
+
+    for cid, state_dict in remaining_clients.items():
+        try:
+            vec = torch.cat([state_dict[key].flatten() for key in last_layer_keys]).cpu().numpy()
+        except KeyError:
+            logging.warning(f"  Client {cid} missing keys. Skipping.")
+            continue
+
+        if np.isfinite(vec).all():
+            norm = np.linalg.norm(vec)
+            if norm > 1e-10:
+                client_vectors.append(vec / norm)
+                client_ids.append(cid)
+            else:
+                logging.warning(f"  Client {cid} has zero norm. Skipping.")
         else:
-            # Euclidean distance
-            d_med_lHoGs[idx] = np.linalg.norm(dict_lHoGs[idx]- median_normal_lHoGs)
+            logging.warning(f"  Client {cid} has non-finite values. Skipping.")
 
-    cluster_lh2 = KMeans(n_clusters=2, random_state=0).fit(np.array(list(d_med_lHoGs.values())).reshape(-1,1))
-    offset_tAtk_id2 = find_minority_id(cluster_lh2)
-    sus_tAtk_id2 = id_lHoGs[list(offset_tAtk_id2)]
-    logging.debug(f"d_med_lHoGs={d_med_lHoGs}")
-    logging.info(f"sus_tAtk_id2: {sus_tAtk_id2}")
-    sus_tAtk_uRel_id = set(list(sus_tAtk_id1)).union(set(list(sus_tAtk_id2)))
-    logging.info(f"sus_tAtk_uRel_id: {sus_tAtk_uRel_id}")
-    return sus_tAtk_uRel_id
+    if len(client_ids) < 4:
+        logging.warning("[LFD-ConsensusVoting] Not enough valid vectors after filtering.")
+        return detected_attackers
 
+    logging.info(f"✅ Valid vectors: {len(client_ids)} clients -> {client_ids}")
 
-def find_targeted_attack(dict_lHoGs):
-    """Construct a set of suspecious of targeted and unreliable clients
-    by using long HoGs (dict_lHoGs dictionary).
-      - cluster: Using KMeans (K=2) based on Euclidean distance of
-      long_HoGs==> find minority ids.
-    """
-    id_lHoGs = np.array(list(dict_lHoGs.keys()))
-    value_lHoGs = np.array(list(dict_lHoGs.values()))
-    cluster_lh1 = KMeans(n_clusters=2, random_state=0).fit(value_lHoGs)
-    #cluster_lh = DBSCAN(eps=35, min_samples=7, metric='mahalanobis', n_jobs=-1).fit(value_lHoGs)
-    #logging.info(f"DBSCAN labels={cluster_lh.labels_}")
-    offset_tAtk_id1 = find_minority_id(cluster_lh1)
-    sus_tAtk_id = id_lHoGs[list(offset_tAtk_id1)]
-    logging.info(f"This round TARGETED ATTACK: {sus_tAtk_id}")
-    return sus_tAtk_id
+    # ========================================================================
+    # STEP 2: 计算初步加权共识方向
+    # ========================================================================
+    logging.info("\n" + "=" * 80)
+    logging.info("STEP 2: Computing Initial Weighted Consensus Direction")
+    logging.info("=" * 80)
+
+    client_vectors_np = np.array(client_vectors)
+
+    # 计算余弦相似度矩阵
+    cosine_matrix = client_vectors_np @ client_vectors_np.T
+
+    # 计算支持分数（每个客户端与其他客户端的相似度之和）
+    support_scores = np.sum(cosine_matrix, axis=1) - 1  # 减1排除自己
+
+    # 使用softmax计算权重
+    weights = np.exp(support_scores) / np.sum(np.exp(support_scores))
+
+    # 加权平均得到初步共识方向
+    consensus_initial = np.average(client_vectors_np, axis=0, weights=weights)
+    consensus_norm = np.linalg.norm(consensus_initial)
+
+    if consensus_norm < 1e-10:
+        logging.error("[LFD-ConsensusVoting] Consensus norm too small. Aborting.")
+        return detected_attackers
+
+    consensus_initial_normalized = consensus_initial / consensus_norm
+
+    logging.info(f"✅ Initial consensus direction computed (norm={consensus_norm:.6f})")
+
+    # ========================================================================
+    # STEP 3: 计算每个客户端与初步共识的余弦相似度
+    # ========================================================================
+    logging.info("\n" + "=" * 80)
+    logging.info("STEP 3: Computing Initial Similarities to Consensus")
+    logging.info("=" * 80)
+
+    initial_similarities = {}
+    for i, cid in enumerate(client_ids):
+        initial_similarities[cid] = np.dot(client_vectors_np[i], consensus_initial_normalized)
+
+    # 打印初步相似度
+    logging.info(f"\nInitial Cosine Similarities (sorted ascending):")
+    logging.info(f"{'CID':<5} {'Similarity':<12} {'Sign':<6}")
+    logging.info("-" * 25)
+
+    for cid in sorted(client_ids, key=lambda x: initial_similarities[x]):
+        sim = initial_similarities[cid]
+        sign = "POS" if sim >= 0 else "NEG"
+        logging.info(f"{cid:<5} {sim:+.6f}      {sign}")
+
+    # ========================================================================
+    # STEP 4: 🗳️ 共识符号选举（投票机制）
+    # ========================================================================
+    logging.info("\n" + "=" * 80)
+    logging.info("STEP 4: 🗳️ Consensus Sign Voting (Majority Vote)")
+    logging.info("=" * 80)
+
+    # 统计正负符号的客户端数量
+    positive_count = sum(1 for sim in initial_similarities.values() if sim >= 0)
+    negative_count = len(initial_similarities) - positive_count
+
+    # 投票决定共识符号
+    consensus_sign = 1 if positive_count > len(initial_similarities) / 2 else -1
+    consensus_sign_str = "POSITIVE" if consensus_sign > 0 else "NEGATIVE"
+
+    logging.info(f"Voting Results:")
+    logging.info(f"  Positive similarity clients: {positive_count} ({positive_count/len(initial_similarities):.1%})")
+    logging.info(f"  Negative similarity clients: {negative_count} ({negative_count/len(initial_similarities):.1%})")
+    logging.info(f"  {'─' * 60}")
+    logging.info(f"  ✅ Consensus Sign (by majority): {consensus_sign_str} (sign={consensus_sign:+d})")
+
+    # 如果需要，翻转共识方向
+    if consensus_sign < 0:
+        consensus_normalized = -consensus_initial_normalized
+        logging.info(f"  🔄 Flipping consensus direction to match negative majority")
+    else:
+        consensus_normalized = consensus_initial_normalized
+        logging.info(f"  ✅ Keeping consensus direction (positive majority)")
+
+    # 重新计算调整后的相似度
+    final_similarities = {}
+    for i, cid in enumerate(client_ids):
+        final_similarities[cid] = np.dot(client_vectors_np[i], consensus_normalized)
+
+    # 打印最终相似度
+    logging.info(f"\n" + "=" * 80)
+    logging.info("STEP 5: Final Similarities After Consensus Adjustment")
+    logging.info("=" * 80)
+    logging.info(f"{'CID':<5} {'Similarity':<12} {'Sign':<6}")
+    logging.info("-" * 25)
+
+    for cid in sorted(client_ids, key=lambda x: final_similarities[x]):
+        sim = final_similarities[cid]
+        sign = "POS" if sim >= 0 else "NEG"
+        logging.info(f"{cid:<5} {sim:+.6f}      {sign}")
+
+    # 统计信息
+    sims_array = np.array(list(final_similarities.values()))
+    logging.info(f"\nFinal Similarity Statistics:")
+    logging.info(f"  Min:    {np.min(sims_array):+.6f}")
+    logging.info(f"  Max:    {np.max(sims_array):+.6f}")
+    logging.info(f"  Mean:   {np.mean(sims_array):+.6f}")
+    logging.info(f"  Median: {np.median(sims_array):+.6f}")
+    logging.info(f"  Std:    {np.std(sims_array):.6f}")
+
+    # ========================================================================
+    # STEP 6: 两级检测策略
+    # ========================================================================
+    logging.info("\n" + "=" * 80)
+    logging.info("STEP 6: Two-Level Detection Strategy")
+    logging.info("=" * 80)
+
+    level1_attackers = set()
+    level2_attackers = set()
+
+    # === Level 1: 符号相反检测（与共识符号相反） ===
+    logging.info(f"\n┌─ Level 1: Sign Mismatch Detection (similarity < {hard_threshold}) ─┐")
+    level1_attackers = {cid for cid, sim in final_similarities.items() if sim < hard_threshold}
+
+    if level1_attackers:
+        logging.warning(f"│ 🚨 Level 1 detected {len(level1_attackers)} attackers (opposite to consensus):")
+        for cid in sorted(level1_attackers):
+            logging.warning(f"│   Client {cid:02d}: similarity={final_similarities[cid]:+.6f}")
+    else:
+        logging.info(f"│ ✅ No attackers with opposite sign to consensus")
+
+    logging.info(f"└{'─' * 60}┘")
+
+    # === Level 2: 自适应间隙法（在同符号客户端中检测微妙攻击） ===
+    logging.info(f"\n┌─ Level 2: Adaptive Gap Method (among same-sign clients) ─┐")
+    remaining_for_gap = {cid: sim for cid, sim in final_similarities.items() if cid not in level1_attackers}
+
+    if len(remaining_for_gap) >= 2:
+        logging.info(f"│ Remaining clients for gap analysis: {len(remaining_for_gap)}")
+        logging.info(f"│ Similarity range: [{min(remaining_for_gap.values()):+.6f}, {max(remaining_for_gap.values()):+.6f}]")
+
+        gap_threshold = find_best_threshold_adaptive(
+            list(remaining_for_gap.values()),
+            min_gap_size=min_gap_size,
+            gap_cos_upper=gap_cos_upper
+        )
+
+        if gap_threshold is not None:
+            level2_attackers = {cid for cid, sim in remaining_for_gap.items() if sim < gap_threshold}
+
+            logging.info(f"│ Gap threshold: {gap_threshold:+.6f}")
+
+            if level2_attackers:
+                logging.warning(f"│ 🚨 Level 2 detected {len(level2_attackers)} subtle attackers:")
+                for cid in sorted(level2_attackers):
+                    logging.warning(f"│   Client {cid:02d}: similarity={remaining_for_gap[cid]:+.6f}")
+            else:
+                logging.info(f"│ ✅ No subtle attackers detected by gap method")
+        else:
+            logging.info(f"│ ℹ️  No significant gap found")
+    else:
+        logging.info(f"│ ⚠️  Skipped (not enough remaining clients)")
+
+    logging.info(f"└{'─' * 60}┘")
+
+    # 综合两级检测结果
+    detected_attackers = level1_attackers | level2_attackers
+
+    # ========================================================================
+    # STEP 7: 安全检查（基数验证）
+    # ========================================================================
+    num_detected = len(detected_attackers)
+    num_remaining = total_clients - num_detected
+    remaining_ratio = num_remaining / total_clients
+
+    logging.info("\n" + "=" * 80)
+    logging.info("🛡️  STEP 7: Safety Check - Cardinality Validation")
+    logging.info("=" * 80)
+    logging.info(f"  Total clients:         {total_clients}")
+    logging.info(f"  Detected as malicious: {num_detected} ({num_detected/total_clients:.1%})")
+    logging.info(f"  Remaining as normal:   {num_remaining} ({remaining_ratio:.1%})")
+    logging.info(f"  Minimum required:      {int(total_clients * min_normal_ratio)} ({min_normal_ratio:.1%})")
+
+    if remaining_ratio < min_normal_ratio:
+        logging.error("=" * 80)
+        logging.error("⚠️⚠️⚠️  CRITICAL ALERT: DETECTION ANOMALY!")
+        logging.error("=" * 80)
+        logging.error(f"  Too many clients flagged as malicious!")
+        logging.error(f"  SAFETY ACTION: Using only Level 1 (sign mismatch)...")
+
+        # 退化策略：只使用Level 1
+        if len(level1_attackers) <= total_clients * (1 - min_normal_ratio):
+            detected_attackers = level1_attackers
+            logging.error(f"  → Using only Level 1: {sorted(list(detected_attackers))}")
+        else:
+            logging.error(f"  → Even Level 1 flagged too many. DISABLING detection this round.")
+            detected_attackers = set()
+
+        logging.error("=" * 80)
+    else:
+        logging.info(f"✅ SAFETY CHECK PASSED: {remaining_ratio:.1%} >= {min_normal_ratio:.1%}")
+
+    # ========================================================================
+    # FINAL SUMMARY
+    # ========================================================================
+    logging.info("\n" + "=" * 80)
+    logging.info("LABEL-FLIPPING DETECTION - FINAL SUMMARY")
+    logging.info("=" * 80)
+    logging.info(f"Detection Method: Consensus Sign Voting + Two-Level")
+    logging.info(f"Consensus Sign: {consensus_sign_str}")
+    logging.info(f"")
+    logging.info(f"Level 1 (Sign Mismatch):   {len(level1_attackers):>2} clients -> {sorted(list(level1_attackers))}")
+    logging.info(f"Level 2 (Adaptive Gap):    {len(level2_attackers):>2} clients -> {sorted(list(level2_attackers))}")
+    logging.info(f"{'─' * 80}")
+    logging.info(f"Total Detected:            {len(detected_attackers):>2} clients -> {sorted(list(detected_attackers))}")
+
+    normal_clients = sorted([cid for cid in client_ids if cid not in detected_attackers])
+    logging.info(f"Normal Clients:            {len(normal_clients):>2} clients -> {normal_clients}")
+    logging.info("=" * 80 + "\n")
+
+    return detected_attackers
+
 
 class Server():
     def __init__(self, model, dataLoader, criterion=F.nll_loss, device='cpu'):
@@ -143,36 +475,59 @@ class Server():
         self.suspicious_id = set()
         self.log_sims = None
         self.log_norms = None
-        # At least tao_0 + delay_decision rounds to get first decision.
-        self.tao_0 = 3
-        self.delay_decision = 2 # 2 consecutive rounds
+        self.tao_0 = 2
+        self.delay_decision = 2
         self.pre_mal_id = defaultdict(int)
         self.count_unreliable = defaultdict(int)
-        # DBSCAN hyper-parameters:
-        self.dbscan_eps = 0.5
-        self.dbscan_min_samples=5
+        self.long = deepcopy(self.model.state_dict())
+        self.short = deepcopy(self.model.state_dict())
+        self.K_avg_s = 3
+        self.hog_avg_s = deque(maxlen=self.K_avg_s)
+        self.normal_clients = []
 
-    def set_log_path(self, log_path, exp_name, t_run):
-        self.log_path = log_path
-        self.log_sim_path = '{}/sims_{}_{}.npy'.format(log_path, exp_name, t_run)
-        self.log_norm_path = '{}/norms_{}_{}.npy'.format(log_path, exp_name, t_run)
-        self.log_results = f'{log_path}/acc_prec_rec_f1_{exp_name}_{t_run}.txt'
-        self.output_file = open(self.log_results, 'w', encoding='utf-8')
+        # 声誉系统参数
+        self.malice_scores = defaultdict(int)
+        self.MALICE_THRESHOLD = 3
+        self.MALICE_DECAY = 1
+        self.MALICE_INCREASE = 1
 
-    def close(self):
-        if self.log_sims is None or self.log_norms is None:
-            return
-        with open(self.log_sim_path, 'wb') as f:
-            np.save(f, self.log_sims, allow_pickle=False)
-        with open(self.log_norm_path, 'wb') as f:
-            np.save(f, self.log_norms, allow_pickle=False)
-        self.output_file.close()
+        # Label-flipping detection parameters (两级检测)
+        self.label_flip_hard_threshold = 0.0
+        self.label_flip_min_gap_size = 0.1
+        self.label_flip_gap_cos_upper = 0.7
+        self.label_flip_min_normal_ratio = 0.3
 
     def init_stateChange(self):
         states = deepcopy(self.model.state_dict())
         for param, values in states.items():
             values *= 0
         self.emptyStates = states
+
+    def set_log_path(self, log_path, exp_name, t_run):
+        self.log_path = log_path
+        self.savePath = log_path
+        self.log_results = f'{log_path}/acc_prec_rec_f1_{exp_name}_{t_run}.txt'
+        self.output_file = open(self.log_results, 'w', encoding='utf-8')
+
+    def close(self):
+        if hasattr(self, 'output_file') and not self.output_file.closed:
+            self.output_file.close()
+
+    def saveChanges(self, clients):
+        if not self.isSaveChanges:
+            return
+        Delta = deepcopy(self.emptyStates)
+        deltas = [c.getDelta() for c in clients]
+        param_trainable = utils.getTrainableParameters(self.model)
+        param_nontrainable = [param for param in Delta.keys() if param not in param_trainable]
+        for param in param_nontrainable:
+            del Delta[param]
+        for param in param_trainable:
+            param_stack = torch.stack([delta[param] for delta in deltas], -1)
+            Delta[param] = param_stack.view(-1, len(clients))
+        savepath = f'{self.savePath}/{self.iter}.pt'
+        torch.save(Delta, savepath)
+        logging.info(f'[Server] Update vectors saved to {savepath}')
 
     def attach(self, c):
         self.clients.append(c)
@@ -189,543 +544,261 @@ class Server():
         test_loss = 0
         correct = 0
         count = 0
-        nb_classes = 10 # for MNIST, Fashion-MNIST, CIFAR-10
+        nb_classes = 10  # for MNIST, Fashion-MNIST, CIFAR-10
         cf_matrix = torch.zeros(nb_classes, nb_classes)
+
         with torch.no_grad():
             for data, target in self.dataLoader:
                 data, target = data.to(self.device), target.to(self.device)
                 output = self.model(data)
                 test_loss += self.criterion(output, target, reduction='sum').item()  # sum up batch loss
+
                 if output.dim() == 1:
                     pred = torch.round(torch.sigmoid(output))
                 else:
                     pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+
                 correct += pred.eq(target.view_as(pred)).sum().item()
                 count += pred.shape[0]
+
+                # 构建混淆矩阵
                 for t, p in zip(target.view(-1), pred.view(-1)):
                     cf_matrix[t.long(), p.long()] += 1
+
+        if count == 0:
+            return 0.0, 0.0
+
         test_loss /= count
         accuracy = 100. * correct / count
-        self.model.cpu()  ## avoid occupying gpu when idle
+
+        self.model.cpu()  # avoid occupying gpu when idle
+
         logging.info(
             '[Server] Test set: Average loss: {:.4f}, Accuracy: {}/{} ({}%)\n'.format(
                 test_loss, correct, count, accuracy))
+
         logging.info(f"[Sever] Confusion matrix:\n {cf_matrix.detach().cpu()}")
-        cf_matrix = cf_matrix.detach().cpu().numpy()
-        row_sum = np.sum(cf_matrix, axis=0) # predicted counts
-        col_sum = np.sum(cf_matrix, axis=1) # targeted counts
-        diag = np.diag(cf_matrix)
-        precision = diag / row_sum # tp/(tp+fp), p is predicted positive.
-        recall = diag / col_sum # tp/(tp+fn)
-        f1 = 2*(precision*recall)/(precision+recall)
-        m_acc = np.sum(diag)/np.sum(cf_matrix)
-        results = {'accuracy':accuracy,'test_loss':test_loss,
-                   'precision':precision.tolist(),'recall':recall.tolist(),
-                   'f1':f1.tolist(),'confusion':cf_matrix.tolist(),
-                   'epoch':self.iter}
-        json.dump(results, self.output_file)
-        self.output_file.write("\n")
-        self.output_file.flush()
+
+        # 计算精度、召回率、F1分数
+        cf_matrix_np = cf_matrix.detach().cpu().numpy()
+        row_sum = np.sum(cf_matrix_np, axis=0)  # predicted counts
+        col_sum = np.sum(cf_matrix_np, axis=1)  # targeted counts
+        diag = np.diag(cf_matrix_np)
+
+        precision = diag / row_sum  # tp/(tp+fp), p is predicted positive.
+        recall = diag / col_sum  # tp/(tp+fn)
+        f1 = 2 * (precision * recall) / (precision + recall)
+        m_acc = np.sum(diag) / np.sum(cf_matrix_np)
+
+        # 构建输出结果字典
+        results = {
+            'accuracy': accuracy,
+            'test_loss': test_loss,
+            'precision': precision.tolist(),
+            'recall': recall.tolist(),
+            'f1': f1.tolist(),
+            'confusion': cf_matrix_np.tolist(),
+            'epoch': self.iter
+        }
+
+        # 写入文件
+        if hasattr(self, 'output_file') and not self.output_file.closed:
+            json.dump(results, self.output_file)
+            self.output_file.write("\n")
+            self.output_file.flush()
+
         logging.info(f"[Server] Precision={precision},\n Recall={recall},\n F1-score={f1},\n my_accuracy={m_acc*100.}[%]")
 
         return test_loss, accuracy
-
-    def test_backdoor(self):
-        logging.info("[Server] Start testing backdoor\n")
-        self.model.to(self.device)
-        self.model.eval()
-        test_loss = 0
-        correct = 0
-        utils = Backdoor_Utils()
-        with torch.no_grad():
-            for data, target in self.dataLoader:
-                data, target = utils.get_poison_batch(data, target, backdoor_fraction=1,
-                                                      backdoor_label=utils.backdoor_label, evaluation=True)
-                data, target = data.to(self.device), target.to(self.device)
-                output = self.model(data)
-                test_loss += self.criterion(output, target, reduction='sum').item()  # sum up batch loss
-                pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
-                correct += pred.eq(target.view_as(pred)).sum().item()
-
-        test_loss /= len(self.dataLoader.dataset)
-        accuracy = 100. * correct / len(self.dataLoader.dataset)
-
-        self.model.cpu()  ## avoid occupying gpu when idle
-        logging.info(
-            '[Server] Test set (Backdoored): Average loss: {:.4f}, Success rate: {}/{} ({:.0f}%)\n'.
-                format(test_loss, correct, len(self.dataLoader.dataset), accuracy))
-        return test_loss, accuracy
-
-    def test_semanticBackdoor(self):
-        logging.info("[Server] Start testing semantic backdoor")
-
-        self.model.to(self.device)
-        self.model.eval()
-        test_loss = 0
-        correct = 0
-        utils = SemanticBackdoor_Utils()
-        with torch.no_grad():
-            for data, target in self.dataLoader:
-                data, target = utils.get_poison_batch(data, target, backdoor_fraction=1,
-                                                      backdoor_label=utils.backdoor_label, evaluation=True)
-                data, target = data.to(self.device), target.to(self.device)
-                output = self.model(data)
-                test_loss += self.criterion(output, target, reduction='sum').item()  # sum up batch loss
-                pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
-                correct += pred.eq(target.view_as(pred)).sum().item()
-
-        test_loss /= len(self.dataLoader.dataset)
-        accuracy = 100. * correct / len(self.dataLoader.dataset)
-
-        self.model.cpu()  ## avoid occupying gpu when idle
-        logging.info(
-            '[Server] Test set (Semantic Backdoored): Average loss: {:.4f}, Success rate: {}/{} ({:.0f}%)\n'.
-                format(test_loss, correct, len(self.dataLoader.dataset), accuracy))
-        return test_loss, accuracy, data, pred
 
     def train(self, group):
         selectedClients = [self.clients[i] for i in group]
         for c in selectedClients:
             c.train()
             c.update()
-
         if self.isSaveChanges:
             self.saveChanges(selectedClients)
-
-        tic = time.perf_counter()
         Delta = self.AR(selectedClients)
-        toc = time.perf_counter()
-        logging.info(f"[Server] The aggregation takes {toc - tic:0.6f} seconds.\n")
-
+        if Delta is None:
+            self.iter += 1
+            return
         for param in self.model.state_dict():
             self.model.state_dict()[param] += Delta[param]
+            self.long[param] += self.model.state_dict()[param]
+        K_s = len(self.hog_avg_s)
+        for param in self.model.state_dict():
+            if K_s == 0:
+                self.short[param] = self.model.state_dict()[param]
+            elif K_s < self.K_avg_s:
+                self.short[param] = (self.short[param] * K_s + self.model.state_dict()[param]) / (K_s + 1)
+            else:
+                self.short[param] += (self.model.state_dict()[param] - self.hog_avg_s[0][param]) / self.K_avg_s
+        self.hog_avg_s.append(deepcopy(self.model.state_dict()))
         self.iter += 1
 
-    def saveChanges(self, clients):
+    def set_AR_param(self, hard_threshold=0.0, min_gap_size=0.1, gap_cos_upper=0.7, min_normal_ratio=0.3):
+        """设置标签翻转检测参数（两级检测）"""
+        self.label_flip_hard_threshold = hard_threshold
+        self.label_flip_min_gap_size = min_gap_size
+        self.label_flip_gap_cos_upper = gap_cos_upper
+        self.label_flip_min_normal_ratio = min_normal_ratio
 
-        Delta = deepcopy(self.emptyStates)
-        deltas = [c.getDelta() for c in clients]
-
-        param_trainable = utils.getTrainableParameters(self.model)
-
-        param_nontrainable = [param for param in Delta.keys() if param not in param_trainable]
-        for param in param_nontrainable:
-            del Delta[param]
-        logging.info(f"[Server] Saving the model weight of the trainable paramters:\n {Delta.keys()}")
-        for param in param_trainable:
-            ##stacking the weight in the innerest dimension
-            param_stack = torch.stack([delta[param] for delta in deltas], -1)
-            shaped = param_stack.view(-1, len(clients))
-            Delta[param] = shaped
-
-        saveAsPCA = False # True
-        saveOriginal = True #False
-        if saveAsPCA:
-            from utils import convert_pca
-            proj_vec = convert_pca._convertWithPCA(Delta)
-            savepath = f'{self.savePath}/pca_{self.iter}.pt'
-            torch.save(proj_vec, savepath)
-            logging.info(f'[Server] The PCA projections of the update vectors have been saved to {savepath} (with shape {proj_vec.shape})')
-#             return
-        if saveOriginal:
-            savepath = f'{self.savePath}/{self.iter}.pt'
-
-            torch.save(Delta, savepath)
-            logging.info(f'[Server] Update vectors have been saved to {savepath}')
-
-    def set_AR_param(self, dbscan_eps=0.5, min_samples=5):
-        logging.info(f"SET DBSCAN eps={dbscan_eps}, min_samples={min_samples}")
-        self.dbscan_eps = dbscan_eps
-        self.min_samples=min_samples
-
-    ## Aggregation functions ##
+        logging.info(f"[Label-Flip Params - Consensus Voting]")
+        logging.info(f"  hard_threshold:        {hard_threshold}")
+        logging.info(f"  min_gap_size:          {min_gap_size}")
+        logging.info(f"  gap_cos_upper:         {gap_cos_upper}")
+        logging.info(f"  min_normal_ratio:      {min_normal_ratio}")
 
     def set_AR(self, ar):
-        if ar == 'fedavg':
-            self.AR = self.FedAvg
-        elif ar == 'median':
-            self.AR = self.FedMedian
-        elif ar == 'gm':
-            self.AR = self.geometricMedian
-        elif ar == 'krum':
-            self.AR = self.krum
-        elif ar == 'mkrum':
-            self.AR = self.mkrum
-        elif ar == 'foolsgold':
-            self.AR = self.foolsGold
-        elif ar == 'residualbase':
-            self.AR = self.residualBase
-        elif ar == 'attention':
-            self.AR = self.net_attention
-        elif ar == 'mlp':
-            self.AR = self.net_mlp
-        elif ar == 'mudhog':
+        if ar == 'mudhog':
             self.AR = self.mud_hog
-        elif ar == 'fedavg_oracle':
-            self.AR = self.fedavg_oracle
         else:
-            raise ValueError("Not a valid aggregation rule or aggregation rule not implemented")
+            self.AR = self.FedAvg
+        logging.info(f"Aggregation rule set to: {ar}")
 
-    def FedAvg(self, clients):
-        out = self.FedFuncWholeNet(clients, lambda arr: torch.mean(arr, dim=-1, keepdim=True))
-        return out
+    def add_mal_id_reputation(self, suspicions):
+        """
+        声誉系统：根据检测结果更新客户端恶意分数
 
-    def fedavg_oracle(self, clients):
-        normal_clients = []
+        1. 检测到恶意 → 分数+1
+        2. 未检测到恶意 → 分数-1（但不低于0）
+        3. 分数 >= MALICE_THRESHOLD → 加入黑名单
+        4. 分数降至0才能从黑名单移除
+        """
+        logging.info("-" * 80)
+        logging.info("REPUTATION SYSTEM: Updating Malice Scores")
+        logging.info("-" * 80)
+
         for i in range(self.num_clients):
-            if i >= 4:
-                normal_clients.append(clients[i])
-        out = self.FedFuncWholeNet(normal_clients, lambda arr: torch.mean(arr, dim=-1, keepdim=True))
-        return out
+            score_before = self.malice_scores[i]
+            was_blacklisted = i in self.mal_ids
 
-    def FedMedian(self, clients):
-        out = self.FedFuncWholeNet(clients, lambda arr: torch.median(arr, dim=-1, keepdim=True)[0])
-        return out
+            if i in suspicions:
+                # 检测到恶意行为：分数增加
+                self.malice_scores[i] += self.MALICE_INCREASE
+                logging.info(
+                    f"  Client {i:02d}: SUSPICIOUS.   Score: {score_before} -> {self.malice_scores[i]} (+{self.MALICE_INCREASE})")
+            elif self.malice_scores[i] > 0:
+                # 未检测到恶意行为：分数衰减
+                self.malice_scores[i] = max(0, self.malice_scores[i] - self.MALICE_DECAY)
+                logging.info(
+                    f"  Client {i:02d}: NORMAL.        Score decay: {score_before} -> {self.malice_scores[i]} (-{self.MALICE_DECAY})")
 
-    def geometricMedian(self, clients):
-        from rules.geometricMedian import Net
-        self.Net = Net
-        out = self.FedFuncWholeNet(clients, lambda arr: Net().cpu()(arr.cpu()))
-        return out
-
-    def krum(self, clients):
-        from rules.multiKrum import Net
-        self.Net = Net
-        out = self.FedFuncWholeNet(clients, lambda arr: Net('krum').cpu()(arr.cpu()))
-        return out
-
-    def mkrum(self, clients):
-        from rules.multiKrum import Net
-        self.Net = Net
-        out = self.FedFuncWholeNet(clients, lambda arr: Net('mkrum').cpu()(arr.cpu()))
-        return out
-
-    def foolsGold(self, clients):
-        from rules.foolsGold import Net
-        self.Net = Net
-        out = self.FedFuncWholeNet(clients, lambda arr: Net().cpu()(arr.cpu()))
-        return out
-
-    def residualBase(self, clients):
-        from rules.residualBase import Net
-        out = self.FedFuncWholeStateDict(clients, Net().main)
-        return out
-
-    def net_attention(self, clients):
-        from aaa.attention import Net
-
-        net = Net()
-        net.path_to_net = self.path_to_aggNet
-
-        out = self.FedFuncWholeStateDict(clients, lambda arr: net.main(arr, self.model))
-        return out
-
-    def net_mlp(self, clients):
-        from aaa.mlp import Net
-
-        net = Net()
-        net.path_to_net = self.path_to_aggNet
-
-        out = self.FedFuncWholeStateDict(clients, lambda arr: net.main(arr, self.model))
-        return out
-
-        ## Helper functions, act as adaptor from aggregation function to the federated learning system##
-
-    def add_mal_id(self, sus_flip_sign, sus_uAtk, sus_tAtk):
-        all_suspicious = sus_flip_sign.union(sus_uAtk, sus_tAtk)
-        for i in range(self.num_clients):
-            if i not in all_suspicious:
-                if self.pre_mal_id[i] == 0:
-                    if i in self.mal_ids:
-                        self.mal_ids.remove(i)
-                    if i in self.flip_sign_ids:
-                        self.flip_sign_ids.remove(i)
-                    if i in self.uAtk_ids:
-                        self.uAtk_ids.remove(i)
-                    if i in self.tAtk_ids:
-                        self.tAtk_ids.remove(i)
-                else: #> 0
-                    self.pre_mal_id[i] = 0
-                    # Unreliable clients:
-                    if i in self.uAtk_ids:
-                        self.count_unreliable[i] += 1
-                        if self.count_unreliable[i] >= self.delay_decision:
-                            self.uAtk_ids.remove(i)
-                            self.mal_ids.remove(i)
-                            self.unreliable_ids.add(i)
-            else:
-                self.pre_mal_id[i] += 1
-                if self.pre_mal_id[i] >= self.delay_decision:
-                    if i in sus_flip_sign:
-                        self.flip_sign_ids.add(i)
-                        self.mal_ids.add(i)
-                    if i in sus_uAtk:
-                        self.uAtk_ids.add(i)
-                        self.mal_ids.add(i)
-                if self.pre_mal_id[i] >= 2*self.delay_decision and i in sus_tAtk:
-                    self.tAtk_ids.add(i)
+            # 判断是否加入黑名单
+            if self.malice_scores[i] >= self.MALICE_THRESHOLD:
+                if i not in self.mal_ids:
+                    logging.warning(f"  🚨 Client {i:02d} CROSSED MALICE THRESHOLD! Blacklisted.")
                     self.mal_ids.add(i)
 
-        logging.debug("mal_ids={}, pre_mal_id={}".format(self.mal_ids, self.pre_mal_id))
-        #logging.debug("Count_unreliable={}".format(self.count_unreliable))
-        logging.info("FLIP-SIGN ATTACK={}".format(self.flip_sign_ids))
-        logging.info("UNTARGETED ATTACK={}".format(self.uAtk_ids))
-        logging.info("TARGETED ATTACK={}".format(self.tAtk_ids))
+            # 只有当分数降至0时，才能从黑名单移除
+            elif i in self.mal_ids:
+                if self.malice_scores[i] == 0:
+                    logging.info(f"  🛡️ Client {i:02d} score reduced to 0. Pardoned from blacklist.")
+                    self.mal_ids.remove(i)
+                else:
+                    logging.info(
+                        f"  ⚠️  Client {i:02d} still blacklisted (score={self.malice_scores[i]}, needs 0 to be pardoned)")
+
+        logging.info("-" * 80)
+        logging.info(f"Current Blacklist: {sorted(list(self.mal_ids))}")
+        logging.info(f"Malice Scores: {dict(sorted([(k, v) for k, v in self.malice_scores.items() if v > 0]))}")
+        logging.info("-" * 80)
 
     def mud_hog(self, clients):
-        # long_HoGs for clustering targeted and untargeted attackers
-        # and for calculating angle > 90 for flip-sign attack
-        long_HoGs = {}
+        """
+        MUD-HoG with Sign-Flipping + Label-Flipping (Two-Level) Detection + Reputation System
 
-        # normalized_sHoGs for calculating angle > 90 for flip-sign attack
-        normalized_sHoGs = {}
-        full_norm_short_HoGs = [] # for scan flip-sign each round
+        根据要求：只检测符号翻转攻击和标签翻转攻击，不检测噪声注入攻击。
+        """
+        if self.iter >= self.tao_0 and (self.iter + 1) % (self.tao_0 + 1) == 0:
+            logging.info("\n" + "=" * 100)
+            logging.info(f"{'':=^100}")
+            logging.info(f"{'DETECTION ROUND ' + str(self.iter):=^100}")
+            logging.info(f"{'':=^100}")
+            logging.info("=" * 100 + "\n")
 
-        # L2 norm short HoGs are for detecting additive noise,
-        # or Gaussian/random noise untargeted attack
-        short_HoGs = {}
+            # 收集长短历史
+            long_HoGs = {i: c.get_sum_hog_old() for i, c in enumerate(clients)}
+            short_HoGs = {i: c.get_avg_grad().detach().cpu().numpy() for i, c in enumerate(clients)}
+            global_short = torch.cat([v.flatten() for v in self.short.values()]).cpu().numpy()
 
-        # STAGE 1: Collect long and short HoGs.
-        for i in range(self.num_clients):
-            # longHoGs
-            sum_hog_i = clients[i].get_sum_hog().detach().cpu().numpy()
-            L2_sum_hog_i = clients[i].get_L2_sum_hog().detach().cpu().numpy()
-            long_HoGs[i] = sum_hog_i
+            # Stage 1: 符号翻转检测
+            logging.info("┌" + "─" * 78 + "┐")
+            logging.info("│" + " STAGE 1: SIGN-FLIPPING DETECTION".center(78) + "│")
+            logging.info("└" + "─" * 78 + "┘")
+            flip_sign_id = detect_sign_flipping_with_global(short_HoGs, global_short)
 
-            # shortHoGs
-            sHoG = clients[i].get_avg_grad().detach().cpu().numpy()
-            #logging.debug(f"sHoG={sHoG.shape}") # model's total parameters, cifar=sHoG=(11191262,)
-            L2_sHoG = np.linalg.norm(sHoG)
-            full_norm_short_HoGs.append(sHoG/L2_sHoG)
-            short_HoGs[i] = sHoG
+            # Stage 2: 标签翻转检测（共识符号选举 + 两级检测）
+            logging.info("\n┌" + "─" * 78 + "┐")
+            logging.info("│" + " STAGE 2: LABEL-FLIPPING (Consensus Voting + Two-Level)".center(78) + "│")
+            logging.info("└" + "─" * 78 + "┘")
+            all_pre_detected = flip_sign_id  # 仅将符号翻转检测结果作为前置排除
 
-            # Exclude the firmed malicious clients
-            if i not in self.mal_ids:
-                normalized_sHoGs[i] = sHoG/L2_sHoG
+            tAtk_id = detect_label_flipping_two_level(
+                long_HoGs,
+                all_pre_detected,
+                hard_threshold=self.label_flip_hard_threshold,
+                min_gap_size=self.label_flip_min_gap_size,
+                gap_cos_upper=self.label_flip_gap_cos_upper,
+                min_normal_ratio=self.label_flip_min_normal_ratio
+            )
 
-        # STAGE 2: Clustering and find malicious clients
-        if self.iter >= self.tao_0:
-            # STEP 1: Detect FLIP_SIGN gradient attackers
-            """By using angle between normalized short HoGs to the median
-            of normalized short HoGs among good candidates.
-            NOTE: we tested finding flip-sign attack with longHoG, but it failed after long running.
-            """
-            flip_sign_id = set()
-            """
-            median_norm_shortHoG = np.median(np.array([v for v in normalized_sHoGs.values()]), axis=0)
-            for i, v in enumerate(full_norm_short_HoGs):
-                dot_prod = np.dot(median_norm_shortHoG, v)
-                if dot_prod < 0: # angle > 90
-                    flip_sign_id.add(i)
-                    #logging.debug("Detect FLIP_SIGN client={}".format(i))
-            logging.info(f"flip_sign_id={flip_sign_id}")
-            """
-            non_mal_sHoGs = dict(short_HoGs) # deep copy dict
-            for i in self.mal_ids:
-                non_mal_sHoGs.pop(i)
-            median_sHoG = np.median(np.array(list(non_mal_sHoGs.values())), axis=0)
-            for i, v in short_HoGs.items():
-                #logging.info(f"median_sHoG={median_sHoG}, v={v}")
-                v = np.array(list(v))
-                d_cos = np.dot(median_sHoG, v)/(np.linalg.norm(median_sHoG)*np.linalg.norm(v))
-                if d_cos < 0: # angle > 90
-                    flip_sign_id.add(i)
-                    #logging.debug("Detect FLIP_SIGN client={}".format(i))
-            logging.info(f"flip_sign_id={flip_sign_id}")
+            # 不进行噪声注入检测，保持空集合占位
+            uAtk_id = set()
 
+            # Stage 3: 声誉系统
+            flip_sign_id = flip_sign_id or set()
+            tAtk_id = tAtk_id or set()
+            all_suspicions = flip_sign_id.union(tAtk_id)
 
-            # STEP 2: Detect UNTARGETED ATTACK
-            """ Exclude sign-flipping first, the remaining nodes include
-            {NORMAL, ADDITIVE-NOISE, TARGETED and UNRELIABLE}
-            we use DBSCAN to cluster them on raw gradients (raw short HoGs),
-            the largest cluster is normal clients cluster (C_norm). For the remaining raw gradients,
-            compute their Euclidean distance to the centroid (mean or median) of C_norm.
-            Then find the bi-partition of these distances, the group of smaller distances correspond to
-            unreliable, the other group correspond to additive-noise (Assumption: Additive-noise is fairly
-            large (since it is attack) while unreliable's noise is fairly small).
-            """
+            logging.info("\n┌" + "─" * 78 + "┐")
+            logging.info("│" + " STAGE 3: REPUTATION SYSTEM UPDATE".center(78) + "│")
+            logging.info("└" + "─" * 78 + "┘")
+            self.add_mal_id_reputation(all_suspicions)
 
-            # Step 2.1: excluding sign-flipping nodes from raw short HoGs:
-            logging.info("===========using shortHoGs for detecting UNTARGETED ATTACK====")
-            for i in range(self.num_clients):
-                if i in flip_sign_id or i in self.flip_sign_ids:
-                    short_HoGs.pop(i)
-            id_sHoGs, value_sHoGs = np.array(list(short_HoGs.keys())), np.array(list(short_HoGs.values()))
-            # Find eps for MNIST and CIFAR:
-            """
-            dist_1 = {}
-            for k,v in short_HoGs.items():
-                if k != 1:
-                    dist_1[k] = np.linalg.norm(v - short_HoGs[1])
-                    logging.info(f"Euclidean distance between 1 and {k} is {dist_1[k]}")
+            # 过滤正常客户端
+            self.normal_clients = [c for i, c in enumerate(clients) if i not in self.mal_ids]
+            if not self.normal_clients:
+                logging.warning("[MUD-HoG] All clients blacklisted! Using all clients to prevent collapse.")
+                self.normal_clients = clients
 
-            logging.info(f"Average Euclidean distances between 1 and others {np.mean(list(dist_1.values()))}")
-            logging.info(f"Median Euclidean distances between 1 and others {np.median(list(dist_1.values()))}")
-            """
+            # 最终汇总
+            logging.info("\n" + "=" * 100)
+            logging.info(f"{'DETECTION SUMMARY - Round ' + str(self.iter):^100}")
+            logging.info("=" * 100)
+            logging.info(f"  Sign-Flip Detection:     {len(flip_sign_id):>3} clients -> {sorted(list(flip_sign_id))}")
+            logging.info(f"  Noise-Injection:         {len(uAtk_id):>3} clients -> {sorted(list(uAtk_id))}")
+            logging.info(f"  Label-Flip (Voting):     {len(tAtk_id):>3} clients -> {sorted(list(tAtk_id))}")
+            logging.info("-" * 100)
+            logging.info(f"  Total Suspicions:        {len(all_suspicions):>3} clients -> {sorted(list(all_suspicions))}")
+            logging.info(f"  Current Blacklist:       {len(self.mal_ids):>3} clients -> {sorted(list(self.mal_ids))}")
+            logging.info(f"  Aggregating From:        {len(self.normal_clients):>3} normal clients")
+            logging.info("=" * 100 + "\n")
 
-            # DBSCAN is mandatory success for this step, KMeans failed.
-            # MNIST uses default eps=0.5, min_sample=5
-            # CIFAR uses eps=50, min_sample=5 (based on heuristic evaluation Euclidean distance of grad of RestNet18.
-            start_t = time.time()
-            cluster_sh = DBSCAN(eps=self.dbscan_eps, n_jobs=-1,
-                min_samples=self.dbscan_min_samples).fit(value_sHoGs)
-            t_dbscan = time.time() - start_t
-            #logging.info(f"CLUSTER DBSCAN shortHoGs took {t_dbscan}[s]")
-            # TODO: comment out this line
-            logging.info("labels cluster_sh= {}".format(cluster_sh.labels_))
-            offset_normal_ids = find_majority_id(cluster_sh)
-            normal_ids = id_sHoGs[list(offset_normal_ids)]
-            normal_sHoGs = value_sHoGs[list(offset_normal_ids)]
-            normal_cent = np.median(normal_sHoGs, axis=0)
-            logging.debug(f"offset_normal_ids={offset_normal_ids}, normal_ids={normal_ids}")
-
-            # suspicious ids of untargeted attacks and unreliable or targeted attacks.
-            offset_uAtk_ids = np.where(cluster_sh.labels_ == -1)[0]
-            sus_uAtk_ids = id_sHoGs[list(offset_uAtk_ids)]
-            logging.info(f"SUSPECTED UNTARGETED {sus_uAtk_ids}")
-
-            # suspicious_ids consists both additive-noise, targeted and unreliable clients:
-            suspicious_ids = [i for i in id_sHoGs if i not in normal_ids] # this includes sus_uAtk_ids
-            logging.debug(f"suspicious_ids={suspicious_ids}")
-            d_normal_sus = {} # distance from centroid of normal to suspicious clients.
-            for sid in suspicious_ids:
-                d_normal_sus[sid] = np.linalg.norm(short_HoGs[sid]-normal_cent)
-
-            # could not find separate points only based on suspected untargeted attacks.
-            #d_sus_uAtk_values = [d_normal_sus[i] for i in sus_uAtk_ids]
-            #d_separate = find_separate_point(d_sus_uAtk_values)
-            d_separate = find_separate_point(list(d_normal_sus.values()))
-            logging.debug(f"d_normal_sus={d_normal_sus}, d_separate={d_separate}")
-            sus_tAtk_uRel_id0, uAtk_id = set(), set()
-            for k, v in d_normal_sus.items():
-                if v > d_separate and k in sus_uAtk_ids:
-                    uAtk_id.add(k)
-                else:
-                    sus_tAtk_uRel_id0.add(k)
-            logging.info(f"This round UNTARGETED={uAtk_id}, sus_tAtk_uRel_id0={sus_tAtk_uRel_id0}")
-
-
-            # STEP 3: Detect TARGETED ATTACK
-            """
-              - First excluding flip_sign and untargeted attack from.
-              - Using KMeans (K=2) based on Euclidean distance of
-                long_HoGs==> find minority ids.
-            """
-            for i in range(self.num_clients):
-                if i in self.flip_sign_ids or i in flip_sign_id:
-                    if i in long_HoGs:
-                        long_HoGs.pop(i)
-                if i in uAtk_id or i in self.uAtk_ids:
-                    if i in long_HoGs:
-                        long_HoGs.pop(i)
-
-            # Using Euclidean distance is as good as cosine distance (which used in MNIST).
-            logging.info("=======Using LONG HOGs for detecting TARGETED ATTACK========")
-            tAtk_id = find_targeted_attack(long_HoGs)
-
-            # Aggregate, count and record ATTACKERs:
-            self.add_mal_id(flip_sign_id, uAtk_id, tAtk_id)
-            logging.info("OVERTIME MALICIOUS client ids ={}".format(self.mal_ids))
-
-            # STEP 4: UNRELIABLE CLIENTS
-            """using normalized short HoGs (normalized_sHoGs) to detect unreliable clients
-            1st: remove all malicious clients (manipulate directly).
-            2nd: find angles between normalized_sHoGs to the median point
-            which mostly normal point and represent for aggreation (e.g., Median method).
-            3rd: find confident mid-point. Unreliable clients have larger angles
-            or smaller cosine similarities.
-            """
-            """
-            for i in self.mal_ids:
-                if i in normalized_sHoGs:
-                    normalized_sHoGs.pop(i)
-
-            angle_normalized_sHoGs = {}
-            # update this value again after excluding malicious clients
-            median_norm_shortHoG = np.median(np.array(list(normalized_sHoGs.values())), axis=0)
-            for i, v in normalized_sHoGs.items():
-                angle_normalized_sHoGs[i] = np.dot(median_norm_shortHoG, v)
-
-            angle_sep_nsH = find_separate_point(list(angle_normalized_sHoGs.values()))
-            normal_id, uRel_id = set(), set()
-            for k, v in angle_normalized_sHoGs.items():
-                if v < angle_sep_nsH: # larger angle, smaller cosine similarity
-                    uRel_id.add(k)
-                else:
-                    normal_id.add(k)
-            """
-            for i in self.mal_ids:
-                if i in short_HoGs:
-                    short_HoGs.pop(i)
-
-            angle_sHoGs = {}
-            # update this value again after excluding malicious clients
-            median_sHoG = np.median(np.array(list(short_HoGs.values())), axis=0)
-            for i, v in short_HoGs.items():
-                angle_sHoGs[i] = np.dot(median_sHoG, v)/(np.linalg.norm(median_sHoG)*np.linalg.norm(v))
-
-            angle_sep_sH = find_separate_point(list(angle_sHoGs.values()))
-            normal_id, uRel_id = set(), set()
-            for k, v in angle_sHoGs.items():
-                if v < angle_sep_sH: # larger angle, smaller cosine similarity
-                    uRel_id.add(k)
-                else:
-                    normal_id.add(k)
-            logging.info(f"This round UNRELIABLE={uRel_id}, normal_id={normal_id}")
-            #logging.debug(f"anlge_normalized_sHoGs={angle_normalized_sHoGs}, angle_sep_nsH={angle_sep_nsH}")
-            logging.debug(f"anlge_sHoGs={angle_sHoGs}, angle_sep_nsH={angle_sep_sH}")
-
-            for k in range(self.num_clients):
-                if k in uRel_id:
-                    self.count_unreliable[k] += 1
-                    if self.count_unreliable[k] > self.delay_decision:
-                        self.unreliable_ids.add(k)
-                # do this before decreasing count
-                if self.count_unreliable[k] == 0 and k in self.unreliable_ids:
-                    self.unreliable_ids.remove(k)
-                if k not in uRel_id and self.count_unreliable[k] > 0:
-                    self.count_unreliable[k] -= 1
-            logging.info("UNRELIABLE clients ={}".format(self.unreliable_ids))
-
-            normal_clients = []
-            for i, client in enumerate(clients):
-                if i not in self.mal_ids and i not in tAtk_id and i not in uAtk_id:
-                    normal_clients.append(client)
-            self.normal_clients = normal_clients
+            Delta = self._multi_chain_aggregate_fast(self.normal_clients)
         else:
-            normal_clients = clients
-        out = self.FedFuncWholeNet(normal_clients, lambda arr: torch.mean(arr, dim=-1, keepdim=True))
-        return out
+            # 非检测轮次：使用上一轮的正常客户端列表
+            if not hasattr(self, 'normal_clients') or not self.normal_clients:
+                self.normal_clients = clients
+            Delta = self._multi_chain_aggregate_fast(self.normal_clients)
 
-    def FedFuncWholeNet(self, clients, func):
-        '''
-        The aggregation rule views the update vectors as stacked vectors (1 by d by n).
-        '''
-        Delta = deepcopy(self.emptyStates)
-        deltas = [c.getDelta() for c in clients]
-        # size is relative to number of samples, actually it is number of batches
-        sizes = [c.get_data_size() for c in clients]
-        total_s = sum(sizes)
-        logging.info(f"clients' sizes={sizes}, total={total_s}")
-        weights = [s/total_s for s in sizes]
-        vecs = [utils.net2vec(delta) for delta in deltas]
-        vecs = [vec for vec in vecs if torch.isfinite(vec).all().item()]
-        weighted_vecs = [w*v for w,v in zip(weights, vecs)]
-        result = func(torch.stack(vecs, 1).unsqueeze(0))  # input as 1 by d by n
-        result = result.view(-1)
-        utils.vec2net(result, Delta)
         return Delta
 
-    def FedFuncWholeStateDict(self, clients, func):
-        '''
-        The aggregation rule views the update vectors as a set of state dict.
-        '''
+    def _multi_chain_aggregate_fast(self, client_list):
+        """Fast aggregation using vectorized operations"""
         Delta = deepcopy(self.emptyStates)
-        deltas = [c.getDelta() for c in clients]
-        # sanity check, remove update vectors with nan/inf values
-        deltas = [delta for delta in deltas if torch.isfinite(utils.net2vec(delta)).all().item()]
-
-        resultDelta = func(deltas)
-
-        Delta.update(resultDelta)
+        N = len(client_list)
+        if N == 0:
+            return Delta
+        vecs_list = [utils.net2vec(c.getDelta()) for c in client_list]
+        vecs = torch.stack([v for v in vecs_list if torch.isfinite(v).all()])
+        if vecs.shape[0] == 0:
+            return Delta
+        w_avg = torch.mean(vecs, dim=0)
+        utils.vec2net(w_avg, Delta)
         return Delta
+
+    def FedAvg(self, clients):
+        """Standard FedAvg aggregation"""
+        return self._multi_chain_aggregate_fast(clients)
+
